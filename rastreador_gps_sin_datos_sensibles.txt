@@ -1,0 +1,214 @@
+// ===== TinyGSM: estas definiciones van ANTES de los #include =====
+#define TINY_GSM_MODEM_SIM800
+#define TINY_GSM_RX_BUFFER 1024
+#define TINY_GSM_DEBUG Serial   // mensajes internos de TinyGSM (borrar la linea para silenciarlos)
+
+#include <HardwareSerial.h>
+#include <TinyGPS++.h>
+#include <StreamDebugger.h>     // muestra el dialogo AT en el Monitor Serial
+#include <TinyGsmClient.h>
+#include <SSLClient.h>          // la de govorox (mbedTLS), NO la de OPEnSLab
+#include <ArduinoHttpClient.h>
+
+HardwareSerial gpsSerial(2);   // UART2 para GPS NEO-6
+HardwareSerial simSerial(1);   // UART1 para SIM800L
+TinyGPSPlus gps;
+
+StreamDebugger debugger(simSerial, Serial);
+TinyGsm modem(debugger);
+TinyGsmClient baseClient(modem);   // TCP plano a traves del SIM800L
+SSLClient secure(&baseClient);     // el TLS lo hace el ESP32
+
+// ---- Configuración general ----
+const char* numeroAdmin = "[NUMERO_DEL_ADMINISTRADOR]"; // a quien avisa
+
+// --- APN Claro Paraguay ---
+const char* apn = "igprs.claro.com.py";
+const char* apnUser = "";
+const char* apnPass = "";
+
+// --- Backend ---
+const char* servidorHost = "aserradero-san-juan.com.py";
+const int   servidorPuerto = 443;
+const char* servidorRuta = "/api/iot/coordenadas";
+const char* identificadorUnico = "TRACKER-2";
+const char* tokenAuth = "[TOKEN_DEL_EQUIPO]";
+
+HttpClient http(secure, servidorHost, servidorPuerto);
+
+// ---- TLS ----
+// 1 = PRUEBA: NO verifica el certificado del servidor (solo para diagnosticar)
+// 0 = normal: verifica el servidor con ROOT_CA
+#define TLS_MODO_PRUEBA 1
+
+static const char ROOT_CA[] PROGMEM = R"EOF(
+-----BEGIN CERTIFICATE-----
+PEGAR_AQUI_LA_RAIZ_ISRG
+-----END CERTIFICATE-----
+)EOF";
+
+// ---- Variables de estado ----
+bool fixAvisado = false;
+unsigned long ultimoEnvioAuto = 0;
+const unsigned long intervaloAuto = 120000; // 2 minutos
+
+void setup() {
+  Serial.begin(115200);
+  gpsSerial.begin(9600, SERIAL_8N1, 16, 17);
+  simSerial.begin(9600, SERIAL_8N1, 18, 19);
+  delay(3000);
+
+#if TLS_MODO_PRUEBA
+  secure.setInsecure();
+  Serial.println("TLS en MODO PRUEBA: no se verifica el certificado del servidor.");
+#else
+  secure.setCACert(ROOT_CA);
+#endif
+  http.setHttpResponseTimeout(60000);
+
+  Serial.println("Iniciando modem...");
+  delay(5000); // darle tiempo al SIM800L a arrancar y leer la SIM
+  bool iniciado = false;
+  for (int i = 0; i < 3 && !iniciado; i++) {
+    iniciado = modem.init();
+    if (!iniciado) {
+      Serial.println("modem.init() fallo, reintentando...");
+      delay(2000);
+    }
+  }
+  Serial.println("Modem: " + modem.getModemInfo());
+  Serial.print("Estado SIM (1 = lista): ");
+  Serial.println((int)modem.getSimStatus());
+
+  bool redOk = conectarRed();   // primero la red, asi los SMS no fallan por modulo no listo
+
+  enviarSMS(numeroAdmin, "Sistema iniciando comunicacion con el modulo GSM...");
+  if (redOk) {
+    enviarSMS(numeroAdmin, "GPRS conectado. Por favor espere, conectando al satelite...");
+  } else {
+    enviarSMS(numeroAdmin, "Fallo la conexion GPRS. Revisar APN. Por favor espere, conectando al satelite...");
+  }
+}
+
+void loop() {
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read());
+  }
+
+  // Primer fix del GPS
+  if (!fixAvisado && gps.location.isValid()) {
+    fixAvisado = true;
+    Serial.println("GPS conectado al satelite. Enviando ubicacion cada 2 minutos.");
+    enviarSMS(numeroAdmin, "GPS conectado al satelite. Enviando ubicacion cada 2 minutos.");
+
+    ultimoEnvioAuto = millis();
+    bool ok = enviarUbicacionPost();
+    responderUbicacion(numeroAdmin, ok);
+  }
+
+  // Envio automatico cada 2 minutos
+  if (fixAvisado && millis() - ultimoEnvioAuto >= intervaloAuto) {
+    ultimoEnvioAuto = millis();
+    bool ok = enviarUbicacionPost();
+    responderUbicacion(numeroAdmin, ok);
+  }
+}
+
+// ---- Red y GPRS (se llama antes de cada envio) ----
+bool conectarRed() {
+  if (!modem.isNetworkConnected()) {
+    Serial.println("Esperando registro en la red...");
+    if (!modem.waitForNetwork(60000L)) {
+      Serial.println("No se registro en la red.");
+      return false;
+    }
+  }
+  if (!modem.isGprsConnected()) {
+    Serial.println("Conectando GPRS...");
+    if (!modem.gprsConnect(apn, apnUser, apnPass)) {
+      Serial.println("Fallo la conexion GPRS.");
+      return false;
+    }
+  }
+  Serial.println("Red y GPRS OK. IP: " + modem.getLocalIP());
+  return true;
+}
+
+// ---- POST HTTPS al backend ----
+bool enviarUbicacionPost() {
+  if (!gps.location.isValid()) {
+    Serial.println("GPS sin fix, no se puede enviar POST.");
+    return false;
+  }
+  if (!conectarRed()) {
+    Serial.println("Sin red/GPRS, no se puede enviar.");
+    return false;
+  }
+
+  double lat = gps.location.lat();
+  double lon = gps.location.lng();
+  double precisionMetros = gps.hdop.isValid() ? gps.hdop.hdop() * 5.0 : 10.0;
+
+  String json = "{";
+  json += "\"identificadorUnico\":\"" + String(identificadorUnico) + "\",";
+  json += "\"token\":\"" + String(tokenAuth) + "\",";
+  json += "\"latitud\":" + String(lat, 6) + ",";
+  json += "\"longitud\":" + String(lon, 6) + ",";
+  json += "\"precisionMetros\":" + String(precisionMetros, 1);
+  json += "}";
+
+  Serial.println("Enviando JSON: " + json);
+  unsigned long t0 = millis();
+
+  int err = http.post(servidorRuta, "application/json", json.c_str());
+  if (err != 0) {
+    // -1 = no pudo conectar (DNS / TCP / handshake TLS), -3 = timeout
+    Serial.print("Fallo al conectar/enviar. Codigo de HttpClient: ");
+    Serial.println(err);
+    Serial.println("Duracion hasta el fallo (ms): " + String(millis() - t0));
+    http.stop();
+    return false;
+  }
+
+  int status = http.responseStatusCode();
+  String body = http.responseBody();
+  http.stop();
+
+  Serial.print("HTTP status: ");
+  Serial.println(status);
+  Serial.println("Respuesta del servidor: " + body);
+  Serial.println("Duracion del POST (ms): " + String(millis() - t0));
+
+  return (status == 200 || status == 202);
+}
+
+// ---- SMS de notificación ----
+void responderUbicacion(const String& numero, bool postOk) {
+  String estado = postOk ? "Enviado al servidor OK." : "AVISO: fallo el envio al servidor.";
+  Serial.println(estado);
+
+  if (gps.location.isValid()) {
+    double lat = gps.location.lat();
+    double lon = gps.location.lng();
+    double precisionMetros = gps.hdop.isValid() ? gps.hdop.hdop() * 5.0 : 10.0;
+    String coords = String(lat, 6) + ", " + String(lon, 6);
+    String mensaje = "[Notificacion automatica]\n" + estado + "\nUbicacion actual:\nLat: " + String(lat, 6) +
+                     "\nLon: " + String(lon, 6) +
+                     "\nPrecision: " + String(precisionMetros, 1) + "m" +
+                     "\n\nPara Maps:\n" + coords;
+    enviarSMS(numero, mensaje);
+  } else {
+    enviarSMS(numero, "[Notificacion automatica]\nNo se conecto al satelite.");
+  }
+}
+
+void enviarSMS(const String& numero, const String& mensaje) {
+  bool ok = modem.sendSMS(numero, mensaje);
+  if (!ok) {
+    Serial.println("SMS fallo, reintentando en 3s...");
+    delay(3000);
+    ok = modem.sendSMS(numero, mensaje);
+  }
+  Serial.println(ok ? "SMS enviado." : "SMS NO se pudo enviar.");
+  delay(2000); // pausa para no encadenar dos SMS pegados
+}
